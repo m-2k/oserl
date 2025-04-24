@@ -5,7 +5,7 @@ defmodule Oserl.MixProject do
     [
       description: "Oserl Smpp",
       app: :oserl,
-      version: "1.1.0",
+      version: "1.1.1",
       language: :erlang,
       elixirc_paths: elixirc_paths(Mix.env()),
       preferred_cli_env: [eunit: :test],
