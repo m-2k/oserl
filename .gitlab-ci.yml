@@ -1,0 +1,19 @@
+variables:
+  LC_ALL: en_US.UTF-8
+
+stages:
+  - test
+
+test:
+  variables:
+    MIX_ENV: test
+  cache:
+    key: ${CI_PROJECT_PATH_SLUG}
+    paths:
+      - _build/
+      - deps/
+  before_script:
+    - mix deps.get
+    - mix compile
+  script:
+    - mix test

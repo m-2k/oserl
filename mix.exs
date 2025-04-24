@@ -18,7 +18,7 @@ defmodule Oserl.MixProject do
     [
       files: ["src", "include", "mix.exs", "README*"],
       maintainers: ["Funbox"],
-      licenses: ["Copyright 2024 Fun-box, all rights reserved"],
+      licenses: ["Copyright 2025 Fun-box, all rights reserved"],
       links: %{"GitHub" => "https://github.com/funbox/oserl.git"}
     ]
   end
