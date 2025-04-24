@@ -1,6 +1,7 @@
 # OSERL
 
-OSERL 3.2.3 needs [common_lib](https://github.com/funbox/common_lib) 3.3.0 or higher.
+based on OSERL 3.2.3, needs [common_lib](https://github.com/funbox/common_lib) 3.3.0 or higher.
+current library version 1.1.0
 
 ## Documentation
 

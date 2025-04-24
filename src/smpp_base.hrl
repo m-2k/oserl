@@ -450,8 +450,8 @@
 
 %% Either absolute or relative.
 -define(VALIDITY_PERIOD_DATATYPE, ?FIXED_C_OCTET_STRING(17)).
--define(VALIDITY_PERIOD_DOMAIN,   ?UNION([?ATIME_C_OCTET_STRING,
-                                          ?RTIME_C_OCTET_STRING])).
+-define(VALIDITY_PERIOD_DOMAIN,   ?UNION([?VPHACK_ATIME_C_OCTET_STRING,
+                                          ?VPHACK_RTIME_C_OCTET_STRING])).
 -define(VALIDITY_PERIOD_RESERVED, ?EMPTY).
 
 %% It must be specified in absolute time format.
@@ -865,7 +865,7 @@
 %% A network_error_code value should be defined using the
 %% network_error_code record.
 -define(NETWORK_ERROR_CODE_TYPE_DATATYPE, ?INTEGER(1)).
--define(NETWORK_ERROR_CODE_TYPE_DOMAIN,   ?RANGE_INTEGER(1, 1, 8)).
+-define(NETWORK_ERROR_CODE_TYPE_DOMAIN,   ?RANGE_INTEGER(1, 0, 8)).
 -define(NETWORK_ERROR_CODE_TYPE_RESERVED,
         ?UNION([?CONSTANT(0), ?RANGE_INTEGER(1, 9, 255)])).
 

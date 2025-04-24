@@ -109,6 +109,17 @@
             size   = 17,
             format = fun(Str) -> cl_string:is_rtime(Str) end}).
 
+-define(VPHACK_ATIME_C_OCTET_STRING,
+        #c_octet_string{
+           fixed  = true,
+           size   = 17,
+           format = fun(_Str) -> true end}).
+-define(VPHACK_RTIME_C_OCTET_STRING,
+        #c_octet_string{
+           fixed  = true,
+           size   = 17,
+           format = fun(_Str) -> true end}).
+
 %% Sets
 -define(EMPTY,     ?UNION([])).
 -define(SET(List), ?UNION(lists:map(fun(C) -> ?CONSTANT(C) end, List))).

@@ -27,7 +27,7 @@
 %%% ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 %%% POSSIBILITY OF SUCH DAMAGE.
 -module(gen_mc_session).
--behaviour(gen_fsm).
+-behaviour(gen_statem).
 
 %%% INCLUDE FILES
 -include_lib("oserl/include/oserl.hrl").
@@ -49,17 +49,17 @@
 %%% INIT/TERMINATE EXPORTS
 -export([init/1, terminate/3]).
 
-%%% GEN_FSM STATE EXPORTS
--export([bound_rx/2,
-         bound_tx/2,
-         bound_trx/2,
+%%% GEN_STATEM STATE EXPORTS
+-export([bound_rx/3,
+         bound_tx/3,
+         bound_trx/3,
          listen/3,
-         open/2,
-         outbound/2,
-         unbound/2]).
+         open/3,
+         outbound/3,
+         unbound/3]).
 
-%%% HANDLE EXPORTS
--export([handle_event/3, handle_sync_event/4, handle_info/3]).
+%%% CALLBACK MODE EXPORTS
+-export([callback_mode/0]).
 
 %%% CODE UPDATE EXPORTS
 -export([code_change/4]).
@@ -90,7 +90,8 @@
          session_init_timer,
          enquire_link_timer,
          inactivity_timer,
-         enquire_link_resp_timer}).
+         enquire_link_resp_timer,
+         proxy_ip_list = []}).
 
 %%%-----------------------------------------------------------------------------
 %%% BEHAVIOUR EXPORTS
@@ -115,45 +116,45 @@ start_link(Mod, Opts) ->
         _LSock    -> start_listen(Mod, Mc, Opts)
     end.
 
-stop(FsmRef) ->
-    stop(FsmRef, normal).
+stop(ServerRef) ->
+    stop(ServerRef, normal).
 
-stop(FsmRef, Reason) ->
-    gen_fsm:sync_send_all_state_event(FsmRef, {stop, Reason}, ?ASSERT_TIME).
+stop(ServerRef, Reason) ->
+    gen_statem:stop(ServerRef, Reason, ?ASSERT_TIME).
 
 
 %%%-----------------------------------------------------------------------------
 %%% SMPP EXPORTS
 %%%-----------------------------------------------------------------------------
-reply(FsmRef, {SeqNum, Reply}) ->
+reply(ServerRef, {SeqNum, Reply}) ->
     Event = {reply, {SeqNum, Reply}},
-    gen_fsm:sync_send_all_state_event(FsmRef, Event, ?ASSERT_TIME).
+    gen_statem:call(ServerRef, Event, ?ASSERT_TIME).
 
-alert_notification(FsmRef, Params) ->
+alert_notification(ServerRef, Params) ->
     Event = {?COMMAND_ID_ALERT_NOTIFICATION, Params},
-    gen_fsm:sync_send_all_state_event(FsmRef, Event, ?ASSERT_TIME).
+    gen_statem:call(ServerRef, Event, ?ASSERT_TIME).
 
-send_event(FsmRef, CmdId, Params) ->
+send_event(ServerRef, CmdId, Params) ->
     Ref = make_ref(),
     Event = {outpdu, CmdId, Params, Ref},
-    gen_fsm:send_all_state_event(FsmRef, Event),
+    gen_statem:cast(ServerRef, Event),
     Ref.
 
-data_sm(FsmRef, Params) ->
-    send_event(FsmRef, ?COMMAND_ID_DATA_SM, Params).
+data_sm(ServerRef, Params) ->
+    send_event(ServerRef, ?COMMAND_ID_DATA_SM, Params).
 
 
-deliver_sm(FsmRef, Params) ->
-    send_event(FsmRef, ?COMMAND_ID_DELIVER_SM, Params).
+deliver_sm(ServerRef, Params) ->
+    send_event(ServerRef, ?COMMAND_ID_DELIVER_SM, Params).
 
 
-unbind(FsmRef) ->
-    send_event(FsmRef, ?COMMAND_ID_UNBIND, []).
+unbind(ServerRef) ->
+    send_event(ServerRef, ?COMMAND_ID_UNBIND, []).
 
 
-outbind(FsmRef, Params) ->
+outbind(ServerRef, Params) ->
     Event = {?COMMAND_ID_OUTBIND, Params},
-    gen_fsm:sync_send_all_state_event(FsmRef, Event).
+    gen_statem:call(ServerRef, Event).
 
 %%%-----------------------------------------------------------------------------
 %%% INIT/TERMINATE EXPORTS
@@ -161,12 +162,13 @@ outbind(FsmRef, Params) ->
 init([Mod, Mc, Opts]) ->
     _Ref = erlang:monitor(process, Mc),
     Timers = proplists:get_value(timers, Opts, ?DEFAULT_TIMERS_SMPP),
+    ProxyIpList= proplists:get_value(proxy_ip_list, Opts, false),
     Log = proplists:get_value(log, Opts),
     case proplists:get_value(lsock, Opts) of
         undefined ->
             init_open(Mod, Mc, proplists:get_value(sock, Opts), Timers, Log);
         LSock ->
-            init_listen(Mod, Mc, LSock, Timers, Log)
+            init_listen(Mod, Mc, LSock, Timers, Log, ProxyIpList)
     end.
 
 
@@ -187,26 +189,28 @@ init_open(Mod, Mc, Sock, Tmr, Log) ->
                        start_timer(Tmr, enquire_link_timer)}}.
 
 
-init_listen(Mod, Mc, LSock, Tmr, Log) ->
+init_listen(Mod, Mc, LSock, Tmr, Log, ProxyIpList) ->
     Self = self(),
-    Pid = spawn_link(smpp_session, wait_accept, [Self, LSock, Log]),
+    Pid = spawn_link(smpp_session, wait_accept, [Self, LSock, Log, ProxyIpList]),
     {ok, listen, #st{mc = Mc,
                      mod = Mod,
                      log = Log,
                      sock_ctrl = Pid,
                      req_tab = smpp_req_tab:new(),
                      op_tab = smpp_req_tab:new(),
-                     timers = Tmr}}.
+                     timers = Tmr,
+                     proxy_ip_list = ProxyIpList}}.
 
 
 terminate(_Reason, _Stn, Std) ->
+    unlink(Std#st.sock_ctrl),
     exit(Std#st.sock_ctrl, kill),
     if Std#st.sock == undefined -> ok; true -> gen_tcp:close(Std#st.sock) end.
 
 %%%-----------------------------------------------------------------------------
 %%% ASYNC REQUEST EXPORTS
 %%%-----------------------------------------------------------------------------
-bound_rx({?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
+bound_rx(cast, {?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
     case handle_peer_unbind(R, St) of
         true ->
             cancel_timer(St#st.inactivity_timer),
@@ -214,25 +218,17 @@ bound_rx({?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
         false ->
             {next_state, bound_rx, St}
     end;
-bound_rx({CmdId, _Pdu} = R, St)
+bound_rx(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_BIND_RECEIVER;
        CmdId == ?COMMAND_ID_BIND_TRANSMITTER;
        CmdId == ?COMMAND_ID_BIND_TRANSCEIVER ->
     esme_ralybnd_resp(R, St#st.sock, St#st.log),
     {next_state, bound_rx, St};
-bound_rx({timeout, _Ref, Timer}, St) ->
-    case handle_timeout(Timer, St) of
-        ok ->
-            {next_state, bound_rx, St};
-        {error, Reason} ->
-            {stop, Reason, St}
-    end;
-bound_rx(R, St) ->
-    esme_rinvbndsts_resp(R, St#st.sock, St#st.log),
-    {next_state, bound_rx, St}.
+bound_rx(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, bound_rx, Data).
 
 
-bound_tx({CmdId, _Pdu} = R, St)
+bound_tx(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_DATA_SM;
        CmdId == ?COMMAND_ID_SUBMIT_SM;
        CmdId == ?COMMAND_ID_SUBMIT_MULTI;
@@ -244,7 +240,7 @@ bound_tx({CmdId, _Pdu} = R, St)
        CmdId == ?COMMAND_ID_CANCEL_SM ->
     handle_peer_operation(R, St),
     {next_state, bound_tx, St};
-bound_tx({?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
+bound_tx(cast, {?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
     case handle_peer_unbind(R, St) of
         true ->
             cancel_timer(St#st.inactivity_timer),
@@ -252,25 +248,17 @@ bound_tx({?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
         false ->
             {next_state, bound_tx, St}
     end;
-bound_tx({CmdId, _Pdu} = R, St)
+bound_tx(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_BIND_RECEIVER;
        CmdId == ?COMMAND_ID_BIND_TRANSMITTER;
        CmdId == ?COMMAND_ID_BIND_TRANSCEIVER ->
     esme_ralybnd_resp(R, St#st.sock, St#st.log),
     {next_state, bound_tx, St};
-bound_tx({timeout, _Ref, Timer}, St) ->
-    case handle_timeout(Timer, St) of
-        ok ->
-            {next_state, bound_tx, St};
-        {error, Reason} ->
-            {stop, Reason, St}
-    end;
-bound_tx(R, St) ->
-    esme_rinvbndsts_resp(R, St#st.sock, St#st.log),
-    {next_state, bound_tx, St}.
+bound_tx(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, bound_tx, Data).
 
 
-bound_trx({CmdId, _Pdu} = R, St)
+bound_trx(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_DATA_SM;
        CmdId == ?COMMAND_ID_SUBMIT_SM;
        CmdId == ?COMMAND_ID_SUBMIT_MULTI;
@@ -282,7 +270,7 @@ bound_trx({CmdId, _Pdu} = R, St)
        CmdId == ?COMMAND_ID_CANCEL_SM ->
     handle_peer_operation(R, St),
     {next_state, bound_trx, St};
-bound_trx({?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
+bound_trx(cast, {?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
     case handle_peer_unbind(R, St) of
         true ->
             cancel_timer(St#st.inactivity_timer),
@@ -290,26 +278,18 @@ bound_trx({?COMMAND_ID_UNBIND, _Pdu} = R, St) ->
         false ->
             {next_state, bound_trx, St}
     end;
-bound_trx({CmdId, _Pdu} = R, St)
+bound_trx(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_BIND_RECEIVER;
        CmdId == ?COMMAND_ID_BIND_TRANSMITTER;
        CmdId == ?COMMAND_ID_BIND_TRANSCEIVER ->
     esme_ralybnd_resp(R, St#st.sock, St#st.log),
     {next_state, bound_trx, St};
-bound_trx({timeout, _Ref, Timer}, St) ->
-    case handle_timeout(Timer, St) of
-        ok ->
-            {next_state, bound_trx, St};
-        {error, Reason} ->
-            {stop, Reason, St}
-    end;
-bound_trx(R, St) ->
-    esme_rinvbndsts_resp(R, St#st.sock, St#st.log),
-    {next_state, bound_trx, St}.
+bound_trx(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, bound_trx, Data).
 
 
-listen({accept, Sock, Addr}, _From, St) ->
-    lager:debug("accepting connection, calling handle_accept of gen_mc ~p", [St#st.mc]),
+listen({call, From}, {accept, Sock, Addr}, St) ->
+    logger:debug("accepting connection, calling handle_accept of gen_mc ~p", [St#st.mc]),
     case (St#st.mod):handle_accept(St#st.mc, Addr) of
         ok ->
             cancel_timer(St#st.session_init_timer),
@@ -318,19 +298,20 @@ listen({accept, Sock, Addr}, _From, St) ->
             cancel_timer(St#st.enquire_link_timer),
             TE = start_timer(St#st.timers, enquire_link_timer),
 
-            {reply, true, open, St#st{sock = Sock,
-                                      session_init_timer = TI,
-                                      enquire_link_timer = TE}};
+            UpdSt = St#st{sock = Sock, session_init_timer = TI, enquire_link_timer = TE},
+            {next_state, open, UpdSt, [{reply, From, true}]};
         {error, _Reason} ->
-            {reply, false, listen, St}
-    end.
+            {next_state, listen, St, [{reply, From, false}]}
+    end;
+listen(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, listen, Data).
 
 
-open(activate, St) ->
+open(cast, activate, St) ->
     ok = gen_tcp:controlling_process(St#st.sock, St#st.sock_ctrl),
     St#st.sock_ctrl ! activate,
     {next_state, open, St};
-open({CmdId, _Pdu} = R, St)
+open(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_BIND_RECEIVER;
        CmdId == ?COMMAND_ID_BIND_TRANSMITTER;
        CmdId == ?COMMAND_ID_BIND_TRANSCEIVER ->
@@ -343,19 +324,11 @@ open({CmdId, _Pdu} = R, St)
         false ->
             {next_state, open, St}
     end;
-open({timeout, _Ref, Timer}, St) ->
-    case handle_timeout(Timer, St) of
-        ok ->
-            {next_state, open, St};
-        {error, Reason} ->
-            {stop, Reason, St}
-    end;
-open(R, St) ->
-    esme_rinvbndsts_resp(R, St#st.sock, St#st.log),
-    {next_state, open, St}.
+open(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, open, Data).
 
 
-outbound({CmdId, _Pdu} = R, St)
+outbound(cast, {CmdId, _Pdu} = R, St)
   when CmdId == ?COMMAND_ID_BIND_RECEIVER;
        CmdId == ?COMMAND_ID_BIND_TRANSMITTER;
        CmdId == ?COMMAND_ID_BIND_TRANSCEIVER ->
@@ -368,28 +341,12 @@ outbound({CmdId, _Pdu} = R, St)
         false ->
             {next_state, open, St}
     end;
-outbound({timeout, _Ref, Timer}, St) ->
-    case handle_timeout(Timer, St) of
-        ok ->
-            {next_state, outbound, St};
-        {error, Reason} ->
-            {stop, Reason, St}
-    end;
-outbound(R, St) ->
-    esme_rinvbndsts_resp(R, St#st.sock, St#st.log),
-    {next_state, outbound, St}.
+outbound(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, outbound, Data).
 
 
-unbound({timeout, _Ref, Timer}, St) ->
-    case handle_timeout(Timer, St) of
-        ok ->
-            {next_state, unbound, St};
-        {error, Reason} ->
-            {stop, Reason, St}
-    end;
-unbound(R, St) ->
-    esme_rinvbndsts_resp(R, St#st.sock, St#st.log),
-    {next_state, unbound, St}.
+unbound(EventType, EventContent, Data) ->
+  handle_event(EventType, EventContent, unbound, Data).
 
 %% Auxiliary function for Event/2 functions.
 %%
@@ -415,11 +372,11 @@ esme_rinvbndsts_resp({CmdId, Pdu}, Sock, Log) ->
 %%%-----------------------------------------------------------------------------
 %%% HANDLE EXPORTS
 %%%-----------------------------------------------------------------------------
-handle_event({input, CmdId, _Pdu, _Lapse, _Timestamp}, Stn, Std)
+handle_event(cast, {input, CmdId, _Pdu, _Lapse, _Timestamp}, Stn, Std)
   when CmdId == ?COMMAND_ID_ENQUIRE_LINK_RESP ->
     cancel_timer(Std#st.enquire_link_resp_timer),
     {next_state, Stn, Std};
-handle_event({input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
+handle_event(cast, {input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
   when CmdId == ?COMMAND_ID_GENERIC_NACK ->
     cancel_timer(Std#st.enquire_link_resp_timer),  % In case it was set
     SeqNum = smpp_operation:get_value(sequence_number, Pdu),
@@ -437,11 +394,11 @@ handle_event({input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
             true
     end,
     {next_state, Stn, Std};
-handle_event({input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
+handle_event(cast, {input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
   when ?IS_RESPONSE(CmdId) ->
     cancel_timer(Std#st.enquire_link_resp_timer),  % In case it was set
     SeqNum = smpp_operation:get_value(sequence_number, Pdu),
-    lager:debug("handle response in gen_mc_session ~p, sequence_number: ~p", [self(), SeqNum]),
+    logger:debug("handle response in gen_mc_session ~p, sequence_number: ~p", [self(), SeqNum]),
     ReqId = ?REQUEST(CmdId),
     case smpp_req_tab:read(Std#st.req_tab, SeqNum) of
         {ok, {SeqNum, ReqId, RTimer, Ref}} ->
@@ -465,7 +422,7 @@ handle_event({input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
             send_response(Nack, ?ESME_RINVCMDID, SeqNum, [], Sock, Log),
             {next_state, Stn, Std}
     end;
-handle_event({input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
+handle_event(cast, {input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
   when CmdId == ?COMMAND_ID_ENQUIRE_LINK ->
     cancel_timer(Std#st.enquire_link_resp_timer),  % In case it was set
 
@@ -478,9 +435,9 @@ handle_event({input, CmdId, Pdu, _Lapse, _Timestamp}, Stn, Std)
     T = start_timer(Std#st.timers, enquire_link_timer),
 
     {next_state, Stn, Std#st{enquire_link_timer = T}};
-handle_event({input, CmdId, Pdu, Lapse, Timestamp}, Stn, Std) ->
+handle_event(cast, {input, CmdId, Pdu, Lapse, Timestamp}, Stn, Std) ->
     cancel_timer(Std#st.enquire_link_resp_timer),  % In case it was set
-    gen_fsm:send_event(self(), {CmdId, Pdu}),
+    gen_statem:cast(self(), {CmdId, Pdu}),
 
     cancel_timer(Std#st.enquire_link_timer),
     TE = start_timer(Std#st.timers, enquire_link_timer),
@@ -492,10 +449,10 @@ handle_event({input, CmdId, Pdu, Lapse, Timestamp}, Stn, Std) ->
     {next_state, Stn, Std#st{congestion_state = C,
                              enquire_link_timer = TE,
                              inactivity_timer = TI}};
-handle_event({error, CmdId, Status, _SeqNum}, _Stn, Std)
+handle_event(cast, {error, CmdId, Status, _SeqNum}, _Stn, Std)
   when ?IS_RESPONSE(CmdId) ->
     {stop, {error, Status}, Std};
-handle_event({error, CmdId, Status, SeqNum}, Stn, Std) ->
+handle_event(cast, {error, CmdId, Status, SeqNum}, Stn, Std) ->
     RespId = case ?VALID_COMMAND_ID(CmdId) of
                  true when CmdId /= ?COMMAND_ID_GENERIC_NACK ->
                      ?RESPONSE(CmdId);
@@ -504,51 +461,64 @@ handle_event({error, CmdId, Status, SeqNum}, Stn, Std) ->
              end,
     send_response(RespId, Status, SeqNum,[], Std#st.sock, Std#st.log),
     {next_state, Stn, Std};
-handle_event(?COMMAND_ID_ENQUIRE_LINK, Stn, Std) ->
+handle_event(cast, ?COMMAND_ID_ENQUIRE_LINK, Stn, Std) ->
     NewStd = send_enquire_link(Std),
     {next_state, Stn, NewStd};
-handle_event({sock_error, _Reason}, unbound, Std) ->
+handle_event(cast, {sock_error, _Reason}, unbound, Std) ->
     gen_tcp:close(Std#st.sock),
     {stop, normal, Std#st{sock = undefined}};
-handle_event({sock_error, Reason}, _Stn, Std) ->
+handle_event(cast, {sock_error, Reason}, _Stn, Std) ->
     gen_tcp:close(Std#st.sock),
     (Std#st.mod):handle_closed(Std#st.mc, Reason),
     {stop, normal, Std#st{sock = undefined}};
-handle_event({listen_error, Reason}, _Stn, Std) ->
+handle_event(cast, {listen_error, Reason}, _Stn, Std) ->
     {stop, Reason, Std};
-handle_event({outpdu, CmdId, Params, Ref}, Stn, Std) ->
+handle_event(cast, {outpdu, CmdId, Params, Ref}, Stn, Std) ->
     NewStd = send_request(CmdId, Params, Ref, Std),
-    {next_state, Stn, NewStd}.
-
-
-handle_info({'DOWN', _Ref, _Type, _Mc, Reason}, _Stn, Std) ->
+    {next_state, Stn, NewStd};
+handle_event(cast, R, Stn, Std) ->
+  esme_rinvbndsts_resp(R, Std#st.sock, Std#st.log),
+  {next_state, Stn, Std};
+handle_event({call, From}, {reply, {SeqNum, Reply}}, Stn, Std) ->
+  {ok, {SeqNum, CmdId}} = smpp_req_tab:read(Std#st.op_tab, SeqNum),
+  RespId = ?RESPONSE(CmdId),
+  Sock = Std#st.sock,
+  Log = Std#st.log,
+  case Reply of
+    {ok, Params} ->
+      send_response(RespId, ?ESME_ROK, SeqNum, Params, Sock, Log);
+    {error, Error} ->
+      send_response(RespId, Error, SeqNum, [], Sock, Log)
+  end,
+  {next_state, Stn, Std, [{reply, From, ok}]};
+handle_event({call, From}, {?COMMAND_ID_OUTBIND, Params}, open, Std) ->
+  NewStd = send_request(?COMMAND_ID_OUTBIND, Params, From, Std),
+  {next_state, outbound, NewStd, [{reply, From, ok}]};
+handle_event({call, From}, {CmdId, Params}, Stn, Std) ->
+  NewStd = send_request(CmdId, Params, From, Std),
+  {next_state, Stn, NewStd, [{reply, From, ok}]};
+handle_event(info, {timeout, _Ref, Timer}, Stn, Std) ->
+  case handle_timeout(Timer, Std) of
+    ok ->
+      {next_state, Stn, Std};
+    {error, Reason} ->
+      {stop, Reason, Std}
+  end;
+handle_event(info, {'DOWN', _Ref, _Type, _Mc, Reason}, _Stn, Std) ->
     {stop, Reason, Std};
-handle_info({inet_reply, _, ok}, Stn, Std) ->
+handle_event(info, {inet_reply, _, ok}, Stn, Std) ->
     {next_state, Stn, Std};
-handle_info({inet_reply, _, Reason}, Stn, Std) ->
-    gen_fsm:send_all_state_event(self(), {sock_error, Reason}),
+handle_event(info, {inet_reply, _, Reason}, Stn, Std) ->
+    gen_statem:cast(self(), {sock_error, Reason}),
     {next_state, Stn, Std};
-handle_info(_Info, Stn, Std) ->
+handle_event(info, _Info, Stn, Std) ->
     {next_state, Stn, Std}.
 
-
-handle_sync_event({stop, Reason}, _From, _Stn, Std) ->
-    {stop, Reason, ok, Std};
-handle_sync_event({reply, {SeqNum, Reply}}, _From, Stn, Std) ->
-    {ok, {SeqNum, CmdId}} = smpp_req_tab:read(Std#st.op_tab, SeqNum),
-    RespId = ?RESPONSE(CmdId),
-    Sock = Std#st.sock,
-    Log = Std#st.log,
-    case Reply of
-        {ok, Params} ->
-            send_response(RespId, ?ESME_ROK, SeqNum, Params, Sock, Log);
-        {error, Error} ->
-            send_response(RespId, Error, SeqNum, [], Sock, Log)
-    end,
-    {reply, ok, Stn, Std};
-handle_sync_event({?COMMAND_ID_OUTBIND, Params}, From, open, Std) ->
-    NewStd = send_request(?COMMAND_ID_OUTBIND, Params, From, Std),
-    {next_state, outbound, NewStd}.
+%%%-----------------------------------------------------------------------------
+%%% CALLBACK MODE EXPORTS
+%%%-----------------------------------------------------------------------------
+callback_mode() ->
+  state_functions.
 
 %%%-----------------------------------------------------------------------------
 %%% CODE UPDATE EXPORTS
@@ -563,11 +533,11 @@ start_connect(Mod, Mc, Opts) ->
     case smpp_session:connect(Opts) of
         {ok, Sock} ->
             Args = [Mod, Mc, [{sock, Sock} | Opts]],
-            case gen_fsm:start_link(?MODULE, Args, []) of
+            case gen_statem:start_link(?MODULE, Args, []) of
                 {ok, Pid} ->
                     case gen_tcp:controlling_process(Sock, Pid) of
                         ok ->
-                            gen_fsm:send_event(Pid, activate),
+                            gen_statem:cast(Pid, activate),
                             {ok, Pid};
                         CtrlError ->
                             gen_tcp:close(Sock),
@@ -582,7 +552,7 @@ start_connect(Mod, Mc, Opts) ->
     end.
 
 start_listen(Mod, Mc, Opts) ->
-    gen_fsm:start_link(?MODULE, [Mod, Mc, Opts], []).
+  gen_statem:start_link(?MODULE, [Mod, Mc, Opts], []).
 
 %%%-----------------------------------------------------------------------------
 %%% HANDLE PEER FUNCTIONS
@@ -604,7 +574,7 @@ handle_peer_bind({CmdId, Pdu}, St) ->
 
 
 handle_peer_operation({CmdId, Pdu}, St) ->
-    lager:debug("handle_peer_operation by gen_mc_session ~p, sequence_number: ~p", [self(), smpp_operation:get_value(sequence_number,Pdu)]),
+    logger:debug("handle_peer_operation by gen_mc_session ~p, sequence_number: ~p", [self(), smpp_operation:get_value(sequence_number,Pdu)]),
     CmdName = ?COMMAND_NAME(CmdId),
     SeqNum = smpp_operation:get_value(sequence_number, Pdu),
     RespId = ?RESPONSE(CmdId),
@@ -642,13 +612,13 @@ handle_peer_unbind({?COMMAND_ID_UNBIND, Pdu}, St) ->
 %%%-----------------------------------------------------------------------------
 %%% HANDLE TIMEOUT
 %%%-----------------------------------------------------------------------------
-handle_timeout({response_timer, SeqNum}, St) ->
+handle_timeout({mc_response_timer, SeqNum}, St) ->
     {ok, {SeqNum, CmdId, _, Ref}} = smpp_req_tab:read(St#st.req_tab, SeqNum),
     Status = smpp_operation:request_failure_code(CmdId),
     handle_peer_resp({error, Status}, Ref, St),
     ok;
 handle_timeout(enquire_link_timer, _St) ->
-    ok = gen_fsm:send_all_state_event(self(), ?COMMAND_ID_ENQUIRE_LINK);
+    ok = gen_statem:cast(self(), ?COMMAND_ID_ENQUIRE_LINK);
 handle_timeout(enquire_link_failure, _St) ->
     {error, {timeout, enquire_link}};
 handle_timeout(session_init_timer, _St) ->
@@ -676,13 +646,12 @@ send_enquire_link(St) ->
           congestion_state = 0}.
 
 
-send_request(CmdId, Params, From, St)
+send_request(CmdId, Params, _From, St)
   when CmdId == ?COMMAND_ID_ALERT_NOTIFICATION;
        CmdId == ?COMMAND_ID_OUTBIND ->
     SeqNum = ?INCR_SEQUENCE_NUMBER(St#st.sequence_number),
     Pdu = smpp_operation:new(CmdId, SeqNum, Params),
     ok = smpp_session:send_pdu(St#st.sock, Pdu, St#st.log),
-    gen_fsm:reply(From, ok),
     cancel_timer(St#st.enquire_link_timer),
     cancel_timer(St#st.inactivity_timer),
     St#st{sequence_number = SeqNum,
@@ -696,7 +665,7 @@ send_request(CmdId, Params, Ref, St) ->
     case smpp_operation:pack(Pdu) of
         {ok, BinPdu} ->
             ok = smpp_session:send_pdu(St#st.sock, BinPdu, St#st.log),
-            RTimer = start_timer(St#st.timers, {response_timer, SeqNum}),
+            RTimer = start_timer(St#st.timers, {mc_response_timer, SeqNum}),
             ok = smpp_req_tab:write(St#st.req_tab, {SeqNum, CmdId, RTimer, Ref}),
             cancel_timer(St#st.enquire_link_timer),
             cancel_timer(St#st.inactivity_timer),

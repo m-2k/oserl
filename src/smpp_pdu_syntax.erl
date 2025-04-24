@@ -191,7 +191,7 @@ pack_unknown([{Type, Value} | NewBody], Acc) when is_integer(Type) and is_binary
             Error
     end;
 pack_unknown([{Type, Value} | NewBody], Acc) ->
-    lager:debug("non-integer type or non-binary value (type = ~p, value = ~p), just skip it~n", [Type, Value]),
+    logger:debug("non-integer type or non-binary value (type = ~p, value = ~p), just skip it~n", [Type, Value]),
     pack_unknown(NewBody, Acc).
 
 unpack_body(BinBody, P) ->
